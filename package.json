@@ -1,0 +1,22 @@
+{
+  "name": "botnode",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "async-lock": "^1.4.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.4.0",
+    "redlock": "^5.0.0-beta.2",
+    "winston": "^3.17.0"
+  },
+  "type": "commonjs"
+}
