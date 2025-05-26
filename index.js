@@ -1,38 +1,39 @@
 const express = require("express");
-const admin = require("firebase-admin");
-const dotenv = require("dotenv");
 const cors = require("cors");
+require("dotenv").config();
+const admin = require("firebase-admin");
 
-dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Inicializa Firebase Admin SDK
-const serviceAccount = require("./tiendasdb-dd848-firebase-adminsdk-uh5v4-1ba3b31c20.json");
-
+// Inicialización de Firebase
+const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+// Firestore y estructuras globales
 const db = admin.firestore();
-const PORT = process.env.PORT || 3000;
-
 let turnoRepartidor = 0;
 let pedidosPendientes = new Map();
 let temporizadoresPedidos = new Map();
 let tiemposRestantes = new Map();
 let asignacionesActivas = new Map();
+const reasignacionesBloqueadas = new Set();
 
-// ================== FUNCIONES PRINCIPALES ================== //
+// Servidor
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor escuchando en puerto ${PORT}`);
+});
+
+// ========== Función de Notificación ========== //
 async function enviarNotificacionPush(token, titulo, cuerpo, dataExtra = {}) {
   const message = {
-    notification: {
-      title: titulo,
-      body: cuerpo,
-    },
-    token: token,
-    data: dataExtra, // Información adicional
+    notification: { title: titulo, body: cuerpo },
+    token,
+    data: dataExtra,
   };
 
   try {
@@ -43,114 +44,143 @@ async function enviarNotificacionPush(token, titulo, cuerpo, dataExtra = {}) {
   }
 }
 
-
-async function intentarAsignarRepartidor(pedidoData, pedidoId, path, repartidorAnteriorId = null) {
-  const pedidoSnap = await db.doc(path).get();
-  if (!pedidoSnap.exists || pedidoSnap.data().estado !== "buscandorepa") {
-    console.log(`🚫 Pedido ${pedidoId} ya fue procesado`);
-    pedidosPendientes.delete(pedidoId);
-    tiemposRestantes.delete(pedidoId);
-    asignacionesActivas.delete(pedidoId);
-    return false;
-  }
-
-  if (asignacionesActivas.has(pedidoId)) {
-    console.log(`🔄 Pedido ${pedidoId} ya está en proceso de asignación`);
-    return false;
-  }
-
-  asignacionesActivas.set(pedidoId, true);
-
-  if (repartidorAnteriorId) {
-    try {
-      await db.collection("repartidores").doc(repartidorAnteriorId)
-        .collection("pedidos").doc(pedidoId).delete();
-      console.log(`🗑️ Eliminada asignación anterior de ${repartidorAnteriorId}`);
-    } catch (error) {
-      console.error("Error eliminando asignación anterior:", error);
-    }
-  }
-
-  const snapshot = await db.collection("repartidores").where("disponible", "==", true).get();
-  if (snapshot.empty) {
-    console.log("❌ No hay repartidores disponibles ahora para", pedidoId);
-    asignacionesActivas.delete(pedidoId);
-    return false;
-  }
-
-  const repartidores = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  const elegido = repartidores[turnoRepartidor % repartidores.length];
-  turnoRepartidor++;
-
-  console.log(`🚴 Asignando pedido ${pedidoId} a: ${elegido.nombre} (${elegido.id})`);
-
-  const tiempoExpiracion = Date.now() + 35000;
-  tiemposRestantes.set(pedidoId, tiempoExpiracion);
-
-  const pedidoRepartidorRef = db.collection("repartidores")
-    .doc(elegido.id).collection("pedidos").doc(pedidoId);
-
+// ========== Función Principal de Asignación ========== //
+async function intentarAsignarRepartidor(dataPedido, pedidoId, path, repartidorAnteriorId = null) {
   try {
+    const pedidoDocRef = db.doc(path);
+    const pedidoSnap = await pedidoDocRef.get();
+
+    if (!pedidoSnap.exists || pedidoSnap.data().estado !== "buscandorepa") {
+      console.log(`🚫 Pedido ${pedidoId} ya fue procesado o no está disponible`);
+      pedidosPendientes.delete(pedidoId);
+      tiemposRestantes.delete(pedidoId);
+      asignacionesActivas.delete(pedidoId);
+      return false;
+    }
+
+    if (asignacionesActivas.has(pedidoId)) {
+      console.log(`🔄 Pedido ${pedidoId} ya en asignación`);
+      return false;
+    }
+
+    asignacionesActivas.set(pedidoId, true);
+
+    if (repartidorAnteriorId) {
+      try {
+        await db.collection("repartidores")
+          .doc(repartidorAnteriorId)
+          .collection("pedidos")
+          .doc(pedidoId)
+          .delete();
+        console.log(`🗑️ Eliminada asignación anterior de ${repartidorAnteriorId}`);
+      } catch (error) {
+        console.error("Error eliminando asignación anterior:", error);
+      }
+    }
+
+    const snapshot = await db.collection("repartidores")
+      .where("disponible", "==", true).get();
+
+    if (snapshot.empty) {
+      console.log("❌ No hay repartidores disponibles para", pedidoId);
+      asignacionesActivas.delete(pedidoId);
+      return false;
+    }
+
+    const repartidores = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const elegido = repartidores[turnoRepartidor % repartidores.length];
+    turnoRepartidor++;
+
+    const pedidoRepartidorRef = db.doc(`repartidores/${elegido.id}/pedidos/${pedidoId}`);
+
     await pedidoRepartidorRef.set({
-      ...pedidoData,
+      ...dataPedido,
       asignado: true,
       aceptado: false,
       timestamp: new Date(),
       pathOriginal: path,
-      tiempoExpiracion: new Date(tiempoExpiracion),
       estadoActualizado: false,
-      repartidorAsignado: elegido.id
+      repartidorAsignado: elegido.id,
+      asignadoEn: admin.firestore.FieldValue.serverTimestamp(),
     });
-   
-    // Obtener el token del repartidor
-if (elegido.fcmToken) {
-  await enviarNotificacionPush(
-    elegido.fcmToken,
-    "📦 Nuevo pedido disponible",
-    `Tienes un nuevo pedido para entregar`,
-    {
-      pedidoId: pedidoId,
-      nombreCliente: pedidoData.nombre || "Cliente",
-      direccion: pedidoData.ubicacion || "",
-    }
-  );
-} else {
-  console.log(`⚠️ Repartidor ${elegido.id} no tiene token FCM`);
-}
 
+    await pedidoDocRef.update({
+      estado: "asignado",
+      asignadoEn: new Date(),
+      repartidorAsignado: elegido.id,
+    });
+
+    console.log(`✅ Pedido ${pedidoId} asignado a ${elegido.nombre || elegido.id}`);
+
+    if (elegido.fcmToken) {
+      await enviarNotificacionPush(
+        elegido.fcmToken,
+        "📦 Nuevo pedido disponible",
+        `Tienes un nuevo pedido para entregar`,
+        {
+          pedidoId: pedidoId,
+          nombreCliente: dataPedido.nombre || "Cliente",
+          direccion: dataPedido.ubicacion || "",
+        }
+      );
+    } else {
+      console.log(`⚠️ Repartidor ${elegido.id} no tiene token FCM`);
+    }
+
+    // Temporizador de espera
     const temporizador = setTimeout(async () => {
       try {
         const snap = await pedidoRepartidorRef.get();
-        if (snap.exists && !snap.data().aceptado) {
-          console.log(`⏰ Tiempo agotado para ${elegido.nombre} (pedido ${pedidoId})`);
-          
+
+        if (snap.exists && snap.data().aceptado === true) {
+          console.log(`✅ Pedido ${pedidoId} aceptado por ${elegido.id}`);
+        } else {
+          console.log(`❌ Pedido ${pedidoId} no aceptado, reintentar`);
+
           await pedidoRepartidorRef.delete();
-          if (pedidosPendientes.has(pedidoId)) {
-            console.log(`🔄 Reasignando pedido ${pedidoId}`);
-            intentarAsignarRepartidor(
-              pedidosPendientes.get(pedidoId), 
-              pedidoId, 
-              path, 
-              elegido.id
-            );
-          }
+          console.log("🗑️ Asignación temporal eliminada");
+
+          await db.runTransaction(async (tx) => {
+            const pedidoTxSnap = await tx.get(pedidoDocRef);
+            if (!pedidoTxSnap.exists) return;
+
+            const estado = pedidoTxSnap.data().estado;
+            if (estado !== "buscandorepa" && estado !== "aceptado") {
+              tx.update(pedidoDocRef, {
+                estado: "buscandorepa",
+                repartidorAsignado: null
+              });
+              console.log("🔄 Pedido reasignado a 'buscandorepa'");
+
+              // Reintentar asignación
+              setTimeout(() => {
+                intentarAsignarRepartidor(dataPedido, pedidoId, path);
+              }, 0);
+            }
+          });
         }
       } catch (error) {
-        console.error(`Error al reasignar pedido ${pedidoId}:`, error);
+        console.error(`🚨 Error en temporizador para ${pedidoId}:`, error);
       } finally {
+        temporizadoresPedidos.delete(pedidoId);
         asignacionesActivas.delete(pedidoId);
       }
-    }, 35000);
+    }, 34000);
 
     temporizadoresPedidos.set(pedidoId, temporizador);
     return true;
+
   } catch (error) {
-    console.error(`Error al asignar pedido ${pedidoId}:`, error);
+    console.error(`❌ Error al asignar pedido ${pedidoId}:`, error);
     asignacionesActivas.delete(pedidoId);
+    temporizadoresPedidos.delete(pedidoId);
     return false;
   }
 }
 
+  
+  
+  
 // ================== LISTENERS FIRESTORE ================== //
 
 db.collectionGroup("ordenes").onSnapshot((snapshot) => {
@@ -194,40 +224,59 @@ db.collectionGroup("ordenes").onSnapshot((snapshot) => {
 
 db.collection("repartidores")
   .where("disponible", "==", true)
-  .onSnapshot(async (snapshot) => {
-    if (!snapshot.empty) {
-      console.log("✅ Hay repartidores disponibles, verificando pedidos...");
-      
+  .onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(change => {
+      if (change.type !== "added") return;
+      const nuevoRepaId = change.doc.id;
+      console.log("➕ Repa disponible:", nuevoRepaId);
+
       for (const [pedidoId, pedido] of pedidosPendientes) {
-        const pedidoRef = db.doc(pedido.path);
-        const pedidoSnap = await pedidoRef.get();
-        
-        if (pedidoSnap.exists && pedidoSnap.data().estado === "buscandorepa") {
-          if (!asignacionesActivas.has(pedidoId)) {
-            await intentarAsignarRepartidor(pedido, pedidoId, pedido.path);
-          }
+        if (reasignacionesBloqueadas.has(pedidoId)) {
+          console.log(`🚫 Pedido ${pedidoId} bloqueado, no reasignación.`);
+          continue;
         }
+        // Si sigue en buscandorepa y sin asignación activa:
+        db.doc(pedido.path).get().then(pedidoSnap => {
+          if (
+            pedidoSnap.exists &&
+            pedidoSnap.data().estado === "buscandorepa" &&
+            !asignacionesActivas.has(pedidoId)
+          ) {
+            intentarAsignarRepartidor(pedido, pedidoId, pedido.path);
+          }
+        });
       }
-    }
+    });
   });
 
-db.collection("repartidores").onSnapshot(async (snapshot) => {
-  for (const doc of snapshot.docs) {
-    const repaId = doc.id;
-    const pedidosSnapshot = await db.collection("repartidores").doc(repaId).collection("pedidos").get();
 
-    for (const pedidoDoc of pedidosSnapshot.docs) {
-      const pedido = pedidoDoc.data();
-      const pedidoId = pedidoDoc.id;
 
-      if (pedido.estadoActualizado || !pedido.pathOriginal) continue;
 
+/// ================== LISTENER REVISADO PARA LA SUB‑COLECCIÓN "pedidos" ==================
+db.collectionGroup("pedidos")
+  .onSnapshot((snapshot) => {
+    snapshot.docChanges().forEach(async (change) => {
+      const pedido = change.doc.data();
+      const pedidoId = change.doc.id;
+      const pedidoRepaRef = change.doc.ref;
+      const pathParts = pedidoRepaRef.path.split("/");
+      const idx = pathParts.indexOf("repartidores");
+      if (idx === -1 || !pathParts[idx + 1]) {
+        console.warn("🔍 Ruta inesperada, salto:", pedidoRepaRef.path);
+        return;
+      }
+      const repaId = pathParts[idx + 1];
       const pedidoRef = db.doc(pedido.pathOriginal);
-      const pedidoRepaRef = db.collection("repartidores").doc(repaId).collection("pedidos").doc(pedidoId);
 
-      if (pedido.aceptado === true) {
-        console.log(`✅ Repartidor ${repaId} aceptó el pedido ${pedidoId}`);
-        try {
+      // Ignoramos la creación inicial
+      if (change.type === "added") return;
+
+      // Sólo modificaciones
+      if (change.type === "modified") {
+        // --- ACEPTÓ ---
+        if (pedido.aceptado === true && !pedido.estadoActualizado) {
+          console.log(`✅ Repartidor ${repaId} aceptó el pedido ${pedidoId}`);
+          // limpia timers y mapas
           if (temporizadoresPedidos.has(pedidoId)) {
             clearTimeout(temporizadoresPedidos.get(pedidoId));
             temporizadoresPedidos.delete(pedidoId);
@@ -236,45 +285,51 @@ db.collection("repartidores").onSnapshot(async (snapshot) => {
           pedidosPendientes.delete(pedidoId);
           asignacionesActivas.delete(pedidoId);
 
+          // actualiza estado en colección principal
           await pedidoRef.update({
             estado: "preparando",
             repartidorId: repaId,
             fechaAceptacion: admin.firestore.FieldValue.serverTimestamp()
           });
 
+          // marca que ya actualizaste para no volver a procesar
           await pedidoRepaRef.update({ estadoActualizado: true });
-        } catch (err) {
-          console.error("⚠️ Error al actualizar pedido aceptado:", err);
         }
-      } else if (pedido.aceptado === false) {
-        console.log(`❌ Repartidor ${repaId} rechazó el pedido ${pedidoId}`);
-        try {
-          await pedidoRepaRef.delete();
-          await db.collection("repartidores").doc(repaId).update({
-            rechazados: admin.firestore.FieldValue.increment(1),
-          });
-
-          asignacionesActivas.delete(pedidoId);
-          temporizadoresPedidos.delete(pedidoId);
-          tiemposRestantes.delete(pedidoId);
-
-          if (pedido.pathOriginal && pedidosPendientes.has(pedidoId)) {
-            setTimeout(() => {
-              console.log(`🔁 Intentando reasignar pedido ${pedidoId}...`);
-              intentarAsignarRepartidor(
-                pedidosPendientes.get(pedidoId), 
-                pedidoId, 
-                pedido.pathOriginal
-              );
-            }, 2000);
+        // --- RECHAZÓ ---
+        else if (pedido.aceptado === false && !pedido.estadoActualizado) {
+          console.log(`❌ Repartidor ${repaId} rechazó el pedido ${pedidoId}`);
+          // limpia timers y mapas
+          if (temporizadoresPedidos.has(pedidoId)) {
+            clearTimeout(temporizadoresPedidos.get(pedidoId));
+            temporizadoresPedidos.delete(pedidoId);
           }
-        } catch (err) {
-          console.error("🔥 Error al eliminar pedido rechazado:", err);
+          tiemposRestantes.delete(pedidoId);
+          pedidosPendientes.delete(pedidoId);
+          asignacionesActivas.delete(pedidoId);
+
+          // elimina doc de asignación
+          await pedidoRepaRef.delete();
+          await db.collection("repartidores").doc(repaId)
+                  .update({ rechazados: admin.firestore.FieldValue.increment(1) });
+
+          // si sigue en 'buscandorepa' lo reasignas
+          const snapMain = await pedidoRef.get();
+          if (snapMain.exists && snapMain.data().estado === "buscandorepa") {
+            console.log(`🔁 Reasignando tras rechazo de ${repaId}...`);
+            setTimeout(() => intentarAsignarRepartidor(
+              pedidosPendientes.get(pedidoId),
+              pedidoId,
+              snapMain.ref.path,
+              repaId
+            ), 2000);
+          }
         }
       }
-    }
-  }
-});
+    });
+  });
+
+
+
 
 // ================== ENDPOINTS ================== //
 
@@ -317,3 +372,4 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🔥 Servidor activo en http://localhost:${PORT}`);
 });
+
