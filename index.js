@@ -222,33 +222,54 @@ db.collectionGroup("ordenes").onSnapshot((snapshot) => {
   });
 });
 
+let timeout; // Para evitar disparos múltiples en poco tiempo
+const repaProcesados = new Set(); // Para evitar procesar el mismo repartidor varias veces
+
 db.collection("repartidores")
   .where("disponible", "==", true)
   .onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-      if (change.type !== "added") return;
-      const nuevoRepaId = change.doc.id;
-      console.log("➕ Repa disponible:", nuevoRepaId);
+    clearTimeout(timeout); // Cancelar si ya hay un temporizador activo
 
-      for (const [pedidoId, pedido] of pedidosPendientes) {
-        if (reasignacionesBloqueadas.has(pedidoId)) {
-          console.log(`🚫 Pedido ${pedidoId} bloqueado, no reasignación.`);
-          continue;
-        }
-        // Si sigue en buscandorepa y sin asignación activa:
-        db.doc(pedido.path).get().then(pedidoSnap => {
-          if (
-            pedidoSnap.exists &&
-            pedidoSnap.data().estado === "buscandorepa" &&
-            !asignacionesActivas.has(pedidoId)
-          ) {
-            intentarAsignarRepartidor(pedido, pedidoId, pedido.path);
+    timeout = setTimeout(() => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type !== "added") return;
+
+        const nuevoRepaId = change.doc.id;
+
+        // Evitar procesar múltiples veces al mismo repartidor
+        if (repaProcesados.has(nuevoRepaId)) return;
+        repaProcesados.add(nuevoRepaId);
+
+        console.log("➕ Repa disponible:", nuevoRepaId);
+
+        for (const [pedidoId, pedido] of pedidosPendientes) {
+          if (reasignacionesBloqueadas.has(pedidoId)) {
+            console.log(`🚫 Pedido ${pedidoId} bloqueado, no reasignación.`);
+            continue;
           }
-        });
-      }
-    });
-  });
 
+          // Obtener el pedido actual desde la base de datos
+          db.doc(pedido.path).get().then(pedidoSnap => {
+            if (
+              pedidoSnap.exists &&
+              pedidoSnap.data().estado === "buscandorepa" &&
+              !asignacionesActivas.has(pedidoId)
+            ) {
+              intentarAsignarRepartidor(pedido, pedidoId, pedido.path);
+            }
+          }).catch(error => {
+            console.error("❌ Error al obtener el pedido:", error);
+          });
+        }
+      });
+
+      // Limpiar repartidores procesados cada 10 segundos (opcional)
+      setTimeout(() => {
+        repaProcesados.clear();
+      }, 10000);
+
+    }, 1000); // Esperar 1 segundo para agrupar múltiples cambios
+  });
 
 
 
