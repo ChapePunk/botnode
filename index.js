@@ -165,7 +165,7 @@ async function intentarAsignarRepartidor(dataPedido, pedidoId, path, repartidorA
         temporizadoresPedidos.delete(pedidoId);
         asignacionesActivas.delete(pedidoId);
       }
-    }, 34000);
+    }, 37000);
 
     temporizadoresPedidos.set(pedidoId, temporizador);
     return true;
@@ -411,5 +411,5 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🔥 Servidor activo en http://localhost:${PORT}`);
-});//NODE 4.02VERSIONPENDIENTE 
+});//NODE 4.03VERSIONPENDIENTE CAMBIOS A 37 SEG.
 //DE SUBIR A LA NUBE
