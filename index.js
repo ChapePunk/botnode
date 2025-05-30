@@ -272,82 +272,101 @@ db.collection("repartidores")
   });
 
 
-
 /// ================== LISTENER REVISADO PARA LA SUB‑COLECCIÓN "pedidos" ==================
-db.collectionGroup("pedidos")
-  .onSnapshot((snapshot) => {
-    snapshot.docChanges().forEach(async (change) => {
-      const pedido = change.doc.data();
-      const pedidoId = change.doc.id;
-      const pedidoRepaRef = change.doc.ref;
-      const pathParts = pedidoRepaRef.path.split("/");
-      const idx = pathParts.indexOf("repartidores");
-      if (idx === -1 || !pathParts[idx + 1]) {
-        console.warn("🔍 Ruta inesperada, salto:", pedidoRepaRef.path);
-        return;
-      }
-      const repaId = pathParts[idx + 1];
-      const pedidoRef = db.doc(pedido.pathOriginal);
+db.collectionGroup("pedidos").onSnapshot((snapshot) => {
+  snapshot.docChanges().forEach(async (change) => {
+    const pedido = change.doc.data();
+    const pedidoId = change.doc.id;
+    const pedidoRepaRef = change.doc.ref;
+    const pathParts = pedidoRepaRef.path.split("/");
 
-      // Ignoramos la creación inicial
-      if (change.type === "added") return;
+    // Detectar ID del repartidor desde la ruta
+    const idx = pathParts.indexOf("repartidores");
+    if (idx === -1 || !pathParts[idx + 1]) {
+      console.warn("🔍 Ruta inesperada, salto:", pedidoRepaRef.path);
+      return;
+    }
+    const repaId = pathParts[idx + 1];
 
-      // Sólo modificaciones
-      if (change.type === "modified") {
-        // --- ACEPTÓ ---
-        if (pedido.aceptado === true && !pedido.estadoActualizado) {
-          console.log(`✅ Repartidor ${repaId} aceptó el pedido ${pedidoId}`);
-          // limpia timers y mapas
-          if (temporizadoresPedidos.has(pedidoId)) {
-            clearTimeout(temporizadoresPedidos.get(pedidoId));
-            temporizadoresPedidos.delete(pedidoId);
-          }
-          tiemposRestantes.delete(pedidoId);
-          pedidosPendientes.delete(pedidoId);
-          asignacionesActivas.delete(pedidoId);
+    // Validar que pathOriginal sea una string no vacía y bien formada
+    if (!pedido.pathOriginal || typeof pedido.pathOriginal !== "string") {
+      console.warn(`❌ pathOriginal inválido para el pedido ${pedidoId}, salto. Valor recibido:`, pedido.pathOriginal);
+      return;
+    }
+    const partesPath = pedido.pathOriginal.split("/");
+    if (partesPath.length < 4) {
+      console.warn(`❌ pathOriginal mal formado: ${pedido.pathOriginal}`);
+      return;
+    }
+    const pedidoRef = db.doc(pedido.pathOriginal);
 
-          // actualiza estado en colección principal
-          await pedidoRef.update({
-            estado: "preparando",
-            repartidorId: repaId,
-            fechaAceptacion: admin.firestore.FieldValue.serverTimestamp()
-          });
+    // Ignorar pedidos nuevos
+    if (change.type === "added") return;
 
-          // marca que ya actualizaste para no volver a procesar
-          await pedidoRepaRef.update({ estadoActualizado: true });
+    // Procesar solo modificaciones
+    if (change.type === "modified") {
+      // --- ACEPTADO ---
+      if (pedido.aceptado === true && !pedido.estadoActualizado) {
+        console.log(`✅ Repartidor ${repaId} aceptó el pedido ${pedidoId}`);
+
+        // Limpiar timers y mapas
+        if (temporizadoresPedidos.has(pedidoId)) {
+          clearTimeout(temporizadoresPedidos.get(pedidoId));
+          temporizadoresPedidos.delete(pedidoId);
         }
-        // --- RECHAZÓ ---
-        else if (pedido.aceptado === false && !pedido.estadoActualizado) {
-          console.log(`❌ Repartidor ${repaId} rechazó el pedido ${pedidoId}`);
-          // limpia timers y mapas
-          if (temporizadoresPedidos.has(pedidoId)) {
-            clearTimeout(temporizadoresPedidos.get(pedidoId));
-            temporizadoresPedidos.delete(pedidoId);
-          }
-          tiemposRestantes.delete(pedidoId);
-          pedidosPendientes.delete(pedidoId);
-          asignacionesActivas.delete(pedidoId);
+        tiemposRestantes.delete(pedidoId);
+        pedidosPendientes.delete(pedidoId);
+        asignacionesActivas.delete(pedidoId);
 
-          // elimina doc de asignación
-          await pedidoRepaRef.delete();
-          await db.collection("repartidores").doc(repaId)
-                  .update({ rechazados: admin.firestore.FieldValue.increment(1) });
+        // Actualizar pedido principal
+        await pedidoRef.update({
+          estado: "preparando",
+          repartidorId: repaId,
+          fechaAceptacion: admin.firestore.FieldValue.serverTimestamp()
+        });
 
-          // si sigue en 'buscandorepa' lo reasignas
-          const snapMain = await pedidoRef.get();
-          if (snapMain.exists && snapMain.data().estado === "buscandorepa") {
-            console.log(`🔁 Reasignando tras rechazo de ${repaId}...`);
-            setTimeout(() => intentarAsignarRepartidor(
+        // Marcar como actualizado para evitar repetición
+        await pedidoRepaRef.update({ estadoActualizado: true });
+      }
+
+      // --- RECHAZADO ---
+      else if (pedido.aceptado === false && !pedido.estadoActualizado) {
+        console.log(`❌ Repartidor ${repaId} rechazó el pedido ${pedidoId}`);
+
+        // Limpiar timers y mapas
+        if (temporizadoresPedidos.has(pedidoId)) {
+          clearTimeout(temporizadoresPedidos.get(pedidoId));
+          temporizadoresPedidos.delete(pedidoId);
+        }
+        tiemposRestantes.delete(pedidoId);
+        pedidosPendientes.delete(pedidoId);
+        asignacionesActivas.delete(pedidoId);
+
+        // Eliminar el doc de asignación
+        await pedidoRepaRef.delete();
+
+        // Sumar rechazo al repartidor
+        await db.collection("repartidores").doc(repaId).update({
+          rechazados: admin.firestore.FieldValue.increment(1)
+        });
+
+        // Reasignar si el pedido sigue buscando
+        const snapMain = await pedidoRef.get();
+        if (snapMain.exists && snapMain.data().estado === "buscandorepa") {
+          console.log(`🔁 Reasignando tras rechazo de ${repaId}...`);
+          setTimeout(() => {
+            intentarAsignarRepartidor(
               pedidosPendientes.get(pedidoId),
               pedidoId,
               snapMain.ref.path,
               repaId
-            ), 2000);
-          }
+            );
+          }, 2000);
         }
       }
-    });
+    }
   });
+});
 
 
 
@@ -392,5 +411,5 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🔥 Servidor activo en http://localhost:${PORT}`);
-});
-
+});//NODE 4.02VERSIONPENDIENTE 
+//DE SUBIR A LA NUBE
