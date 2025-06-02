@@ -141,22 +141,29 @@ async function intentarAsignarRepartidor(dataPedido, pedidoId, path, repartidorA
           console.log("🗑️ Asignación temporal eliminada");
 
           await db.runTransaction(async (tx) => {
-            const pedidoTxSnap = await tx.get(pedidoDocRef);
-            if (!pedidoTxSnap.exists) return;
+          const pedidoTxSnap = await tx.get(pedidoDocRef);
+if (!pedidoTxSnap.exists) return;
 
-            const estado = pedidoTxSnap.data().estado;
-            if (estado !== "buscandorepa" && estado !== "aceptado") {
-              tx.update(pedidoDocRef, {
-                estado: "buscandorepa",
-                repartidorAsignado: null
-              });
-              console.log("🔄 Pedido reasignado a 'buscandorepa'");
+const estado = pedidoTxSnap.data().estado;
+if (estado === "buscandorepa") {
+  tx.update(pedidoDocRef, {
+    estado: "buscandorepa",
+    repartidorAsignado: null
+  });
 
-              // Reintentar asignación
-              setTimeout(() => {
-                intentarAsignarRepartidor(dataPedido, pedidoId, path);
-              }, 0);
-            }
+  console.log("🔄 Pedido reasignado a 'buscandorepa'");
+
+  // Reintentar asignación de forma segura
+  setTimeout(async () => {
+    try {
+      await intentarAsignarRepartidor(dataPedido, pedidoId, path);
+    } catch (error) {
+      console.error("❌ Error al reintentar asignación:", error);
+    }
+  }, 0);
+}
+
+
           });
         }
       } catch (error) {
@@ -411,5 +418,4 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🔥 Servidor activo en http://localhost:${PORT}`);
-});//NODE 4.03VERSIONPENDIENTE CAMBIOS A 37 SEG.
-//DE SUBIR A LA NUBE
+});//NODE 4.04VERSION corregida en la parte de reasignaciones FALTA SUBIR A GIT
